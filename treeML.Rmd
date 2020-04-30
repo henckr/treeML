@@ -1,0 +1,826 @@
+---
+title: 'Tree-based ML for insurance pricing'
+author: 'Roel Henckaerts, Marie-Pier Côté, Katrien Antonio and Roel Verbelen'
+output: 
+  html_notebook:
+    toc: true
+    toc_float: true
+    code_folding : none
+    theme : cosmo
+---
+
+```{css, echo = FALSE}
+pre code, pre, code {
+  white-space: pre !important;
+  overflow-x: scroll !important;
+  word-break: keep-all !important;
+  word-wrap: initial !important;
+}
+```
+
+<style>
+body { text-align: justify}
+</style>
+
+This R Markdown Notebook illustrates the techniques used in the paper "Boosting insights in insurance tariff plans with tree-based machine learning methods" via code examples. The full paper is available on [arXiv](https://arxiv.org/abs/1904.10890) and is published in the [North American Actuarial Journal](https://www.tandfonline.com/toc/uaaj20/current).
+
+```{r setup, include = FALSE}
+library(tidyverse)
+ggplot2::theme_set(theme_bw())
+ggplot2::theme_update(text = element_text(size = 20))
+```
+
+
+## MTPL portfolio
+
+We study a motor third party liability (MTPL) portfolio. Details on the data are available in Section 4.1 of the paper.
+
+```{r data_read}
+mtpl_data <- readRDS('mtpl_data.rds')
+str(mtpl_data)
+```
+
+The following variables are used as predictor features, see Table 7 in Appendix A of the paper for a description.
+
+```{r data_vars}
+features <- c('coverage', 'fuel', 'sex', 'use', 'fleet', 
+              'ageph', 'power', 'agec', 'bm',
+              'long', 'lat')
+```
+
+
+## Train and test split
+
+We follow the same data partition approach as discussed in the "Cross-validation" paragraph of Section 3.3 in the paper. It partitions the data in six subsets and allows us to replicate the summary statistics of Table 2 as follows:
+
+```{r data_fold}
+# Add the fold indicator
+mtpl_data <- mtpl_data %>% dplyr::arrange(nclaims, amount, expo) %>% 
+  dplyr::mutate(fold = paste0('data', rep(seq_len(6), length = nrow(mtpl_data))))
+# Calculate summary statistics
+mtpl_data %>% dplyr::group_by(fold) %>% 
+  dplyr::summarise(sum(nclaims) / sum(expo),
+                   sum(amount) / sum(nclaims))
+```
+
+In this Notebook we assign $\mathcal{D}_3$ as the test set and the collection $\{ \mathcal{D}_1, \mathcal{D}_2, \mathcal{D}_4, \mathcal{D}_5, \mathcal{D}_6 \}$ as the training set. This matches the setup of "Data fold 3" in Figure 3 of the paper with the training data in blue and the test data in red.
+
+```{r data_split}
+# Subset the training data
+mtpl_trn <- mtpl_data %>% dplyr::filter(fold != 'data3')
+# Subset the test data
+mtpl_tst <- mtpl_data %>% dplyr::filter(fold == 'data3')
+```
+
+This results in `r nrow(mtpl_trn)`/`r nrow(mtpl_tst)` observations in the train/test data respectively. In the following modeling sections, we use the hyper-parameter settings from Table 1 and the optimal tuning parameter settings from Table 3 for data fold 3.
+
+## Frequency modeling
+
+We start by modeling claim frequency, i.e., the number of claims a policyholder is expected to file with the insurer. It is important to account for the period of exposure-to-risk, i.e., the fraction of the year that a policyholder was covered by the policy and therefore exposed to the risk of filing a claim. The number of claims and exposure period are available in `mtpl_data` as the variables `nclaims` and `expo` respectively:
+
+```{r freq_data, fig.width=8, fig.height=4}
+gridExtra::grid.arrange(
+  ggplot(mtpl_data, aes(x = nclaims)) + 
+    geom_bar(aes(y = (..count..)/sum(..count..)), col = 'black') + 
+    labs(y = 'Proportion') + scale_y_continuous(labels = scales::percent),
+  ggplot(mtpl_data, aes(x = expo)) +
+    geom_histogram(aes(y = (..count..)/sum(..count..)), binwidth = 0.05, col = 'black') +
+    labs(y = 'Proportion') + scale_y_continuous(labels = scales::percent),
+  ncol = 2
+)
+```
+
+
+### Regression tree
+
+We fit a Poisson regression tree for claim frequency with the `rpart()` function and `method = 'poisson'` from the `distRforest` package (available from Roel Henckaerts's [GitHub](https://github.com/henckr/distRforest)):
+
+```{r freq_tree}
+# devtools::install_github('henckr/distRforest')
+library(distRforest)
+tree_freq <- distRforest::rpart(
+  formula = as.formula(paste('cbind(expo, nclaims) ~', paste(features, collapse = ' + '))),
+  data = mtpl_trn,
+  method = 'poisson',
+  parms = list(shrink = 0.125), # gamma in Table 3
+  control = rpart.control(cp = 1.1e-4, # cp in Table 3
+                          minbucket = 0.01 * nrow(mtpl_trn), # kappa in Table 1
+                          xval = 0,
+                          maxcompete = 0,
+                          maxsurrogate = 0)
+  )
+```
+
+*Note: [`distRforest`](https://henckr.github.io/distRforest/) is an extension of `rpart` and allows for severity distributions and random forest generation.*
+
+### Random forest
+
+We fit a Poisson random forest for claim frequency with the `rforest()` function and `method = 'poisson'` from the `distRforest` package (available from Roel Henckaerts's [GitHub](https://github.com/henckr/distRforest)):
+
+```{r freq_rf}
+set.seed(54321)
+rf_freq <- distRforest::rforest(
+  formula = as.formula(paste('cbind(expo, nclaims) ~', paste(features, collapse = ' + '))),
+  data = mtpl_trn,
+  method = 'poisson',
+  ntrees = 400, # T in Table 3
+  ncand = 8, # m in Table 3
+  subsample = 0.75, # delta in Table 1
+  parms = list(shrink = 0.25), # gamma in Table 1
+  control = rpart.control(cp = 0, # cp in Table 1
+                          minbucket = 0.01 * 0.75 * nrow(mtpl_trn), # kappa * delta in Table 1
+                          xval = 0,
+                          maxcompete = 0,
+                          maxsurrogate = 0),
+  red_mem = TRUE # reduces the memory footprint of individual rpart trees
+  )
+```
+
+### Gradient boosting machine
+
+We fit a Poisson GBM for claim frequency with the `gbm()` function and `distribution = 'poisson'` from the `gbm` package (available from Harry Southworth's [GitHub](https://github.com/harrysouthworth/gbm)):
+
+```{r freq_gbm, message = FALSE}
+# devtools::install_github('harrysouthworth/gbm')
+library(gbm)
+set.seed(54321)
+gbm_freq <- gbm(
+  formula = as.formula(paste('nclaims ~ offset(log(expo)) +', paste(features, collapse = ' + '))),
+  data = mtpl_trn,
+  distribution = 'poisson',
+  n.trees = 1400, # T in Table 3
+  interaction.depth = 5, # d in Table 3
+  shrinkage = 0.01, # lambda in Table 1
+  bag.fraction = 0.75, # delta in Table 1
+  n.minobsinnode = 0.01 * 0.75 * nrow(mtpl_trn), # kappa * delta in Table 1
+  verbose = FALSE
+  )
+```
+
+*Note: Unlike the CRAN version of `gbm`, HS's implementation allows for a gamma distribution for claim severity.*
+
+## Severity modeling
+
+Next, we also model claim severity, i.e., the expected loss amount for a claim if it gets filed. The variable `amount` in `mtpl_data` contains the total loss amount over all claims filed by a policyholder. In order to get an estimate of the individual claim severity, the variable `average` contains the total loss amount divided by the number of claims. Only the observations containing a claim can be used to model claim severity:
+
+```{r sev_data, fig.width=8, warning = FALSE, fig.height=4}
+# Only retain the claims
+mtpl_trn_claims <- mtpl_trn %>% dplyr::filter(nclaims > 0)
+# Plot the density of all observations and those below 10 000 Euro
+gridExtra::grid.arrange(
+  ggplot(mtpl_trn_claims, aes(x = average)) + 
+    geom_density(adjust = 3, col = 'black', fill = 'gray') +
+    labs(y = 'Density'),
+  ggplot(mtpl_trn_claims, aes(x = average)) + 
+    geom_density(adjust = 3, col = 'black', fill = 'gray') +
+    labs(y = 'Density') + xlim(0, 1e4),
+  ncol = 2
+  )
+```
+
+### Regression tree
+
+We fit a gamma regression tree for claim severity with the `rpart()` function and `method = 'gamma'` from the `distRforest` package (available from Roel Henckaerts's [GitHub](https://github.com/henckr/distRforest)):
+
+```{r sev_tree}
+tree_sev <- distRforest::rpart(
+  formula = as.formula(paste('average ~', paste(features, collapse = ' + '))),
+  data = mtpl_trn_claims,
+  weights = nclaims,
+  method = 'gamma',
+  control = rpart.control(cp = 3.7e-3, # cp in Table 3
+                          minbucket = 0.01 * nrow(mtpl_trn_claims), # kappa in Table 1
+                          xval = 0,
+                          maxcompete = 0,
+                          maxsurrogate = 0)
+  )
+```
+
+### Random forest
+
+We fit a gamma random forest for claim severity with the `rforest()` function and `method = 'gamma'` from the `distRforest` package (available from Roel Henckaerts's [GitHub](https://github.com/henckr/distRforest)):
+
+```{r sev_rf}
+set.seed(54321)
+rf_sev <- distRforest::rforest(
+  formula = as.formula(paste('average ~', paste(features, collapse = ' + '))),
+  data = mtpl_trn_claims,
+  weights = nclaims,
+  method = 'gamma',
+  ntrees = 600, # T in Table 3
+  ncand = 1, # m in Table 3
+  subsample = 0.75, # delta in Table 1
+  control = rpart.control(cp = 0, # cp in Table 1
+                          minbucket = 0.01 * 0.75 * nrow(mtpl_trn_claims), # kappa * delta in Table 1
+                          xval = 0,
+                          maxcompete = 0,
+                          maxsurrogate = 0),
+  red_mem = TRUE # reduces the memory footprint of individual rpart trees
+  )
+```
+
+
+### Gradient boosting machine
+
+We fit a gamma GBM for claim severity with the `gbm()` function and `distribution = 'gamma'` from the `gbm` package (available from Harry Southworth's [GitHub](https://github.com/harrysouthworth/gbm)):
+
+```{r sev_gbm, message = FALSE}
+set.seed(54321)
+gbm_sev <- gbm(
+  formula = as.formula(paste('average ~', paste(features, collapse = ' + '))),
+  data = mtpl_trn_claims,
+  weights = nclaims,
+  distribution = 'gamma',
+  n.trees = 500, # T in Table 3
+  interaction.depth = 1, # d in Table 3
+  shrinkage = 0.01, # lambda in Table 1
+  bag.fraction = 0.75, # delta in Table 1
+  n.minobsinnode = 0.01 * 0.75 * nrow(mtpl_trn_claims), # kappa * delta in Table 1
+  verbose = FALSE
+  )
+```
+
+## Prediction functions
+Now all ML models are fit, we can start analyzing them. To streamline this process, we define a predict function `predict_model` that can be applied to the different models in a uniform way:
+
+```{r pred_fun}
+# Generic prediction function
+predict_model <- function(object, newdata) UseMethod('predict_model')
+# Prediction function for a regression tree
+predict_model.rpart <- function(object, newdata) {
+  predict(object, newdata, type = 'vector')
+}
+# Prediction function for a random forest
+predict_model.rforest <- function(object, newdata) {
+  predict(object, newdata)
+}
+# Prediction function for a GBM
+predict_model.gbm <- function(object, newdata) {
+  predict(object, newdata, n.trees = object$n.trees, type = 'response')
+}
+```
+
+
+## Model interpretation
+We now focus on extracting insights from the ML models with variable importance scores, partial dependence plots (PDPs) and individual conditional expectations (ICEs). Details are available in Sections 3.4 and 4.3 of the paper.
+
+### Variable importance
+A first interesting insight is to know which features are important according to your model. This information can be obtained in the following way for the different models considered:
+
++ regression tree: access importance scores of an `rpart` object via `object$variable.importance`
++ random forest: apply the function `distRforest::importance_rforest` to the `rforest` object
++ gradient boosting machine: apply the function `summary` (with optional arguments) to the `gbm` object
+
+These three options are coded in the function `var_imp` below to generate a uniform output. The function `plot_var_imp` takes the calculated importance scores and shows the results in a `ggplot` bar chart.
+
+```{r var_imp_fun}
+var_imp <- function(object) {
+  # Calculate non-normalized importance scores based on the model class
+  switch(class(object)[1],
+         'rpart' = data.frame(variable = names(object$variable.importance),
+                              importance = object$variable.importance),
+         'rforest' = object %>% distRforest::importance_rforest() %>% 
+                      dplyr::select(variable, importance),
+         'gbm' = object %>% summary(plotit = FALSE, normalize = FALSE) %>% 
+                      setNames(c('variable', 'importance'))
+         ) %>% 
+    # Normalize the scores to sum to one
+    dplyr::mutate(scale_sum = round(importance / sum(importance), digits = 4))
+}
+
+plot_var_imp <- function(data) {
+  data %>% ggplot(aes(x = reorder(variable, scale_sum), y = scale_sum)) + 
+    geom_bar(stat = 'identity') + coord_flip() + 
+    labs(x = '', y = 'importance')
+}
+```
+
+The variable importance scores for the three frequency ML models are shown below. These are the green bars for data fold 3 in the left panels of Figure 5 in the paper.
+
+```{r var_imp_freq, fig.width = 8, fig.height=4}
+gridExtra::grid.arrange(tree_freq %>% var_imp %>% plot_var_imp,
+                        rf_freq %>% var_imp %>% plot_var_imp,
+                        gbm_freq %>% var_imp %>% plot_var_imp,
+                        ncol = 3)
+```
+
+The variable importance scores for the three severity ML models are shown below. These are the green bars for data fold 3 in the right panels of Figure 5 in the paper.
+
+```{r var_imp_sev, fig.width = 8, fig.height=4}
+gridExtra::grid.arrange(tree_sev %>% var_imp %>% plot_var_imp,
+                        rf_sev %>% var_imp %>% plot_var_imp,
+                        gbm_sev %>% var_imp %>% plot_var_imp,
+                        ncol = 3)
+```
+
+
+### PDPs
+We use partial dependence plots (PDPs) to get an insight on the relation between a feature and the target. The function `par_dep` performs the essential steps to generate such a PD effect. The following steps are performed for each value in a predefined grid of the variable of interest:
+
++ use the original training data (or a subset to speedup calculations)
++ change the value of the variable of interest to the current value in the grid for all observations
++ predict the model on this altered data set
++ calculate the mean of all these predictions to get the PD effect for the current grid value
+
+
+```{r pdp_fun}
+par_dep <- function(object, data, grid) {
+  # Initialize a vector to save the effect
+  pd_effect <- rep(0, nrow(grid))
+  # Iterate over the grid values to calculate the effect
+  for (i in seq_len(length(pd_effect))) {
+    pd_effect[i] <- 
+      data %>% 
+      dplyr::mutate(!! names(grid) := grid[i, ]) %>% 
+      predict_model(object, newdata = .) %>% 
+      mean()
+  }
+  return(pd_effect)
+}
+```
+
+We will now use this function to generate the PD effect for the age of the policyholder in the frequency models:
+
+```{r pdp_data, warning = FALSE}
+# Use a random sample of the training observations
+set.seed(54321)
+mtpl_trn_sample <- mtpl_trn[sample(seq_len(nrow(mtpl_trn)), size = 10000), ]
+# Define the grid for the ages
+grid_ageph <- data.frame('ageph' = 18:90)
+# Calculate the PD effect for each ML model
+grid_ageph <- grid_ageph %>% 
+  dplyr::mutate(tree = tree_freq %>% par_dep(data = mtpl_trn_sample,
+                                             grid = grid_ageph),
+                rf = rf_freq %>% par_dep(data = mtpl_trn_sample,
+                                         grid = grid_ageph),
+                gbm = gbm_freq %>% par_dep(data = mtpl_trn_sample,
+                                           grid = grid_ageph))
+
+```
+
+After some reshaping we can plot these effects on top of each other. The effects for the tree and the gbm correspond to the green lines in the bottom panels of Figure 6.
+
+```{r pdp_plot, fig.width = 8, fig.height=4}
+grid_ageph %>% reshape2::melt(id.vars = 'ageph',
+                              value.name = 'pd',
+                              variable.name = 'method') %>% 
+  ggplot(aes(x = ageph, y = pd)) + 
+  geom_line(aes(group = method, colour = method))
+```
+
+
+### ICEs
+An individual conditional expectation (ICE) curve is generated in a very comparable way to a PDP. The same steps as listed above are followed, only the last step is not performed. An ICE curve shows the individual predictions instead of averaging all the predictions (like in a PDP). The function `ice` to generate an ICE curve is therefore very similar to `par_dep`:
+
+```{r ice_fun}
+ice <- function(object, data, grid) {
+  # Initialize a matrix to save the effect
+  ice_effect <- matrix(0, nrow = nrow(grid), ncol = nrow(data))
+  # Iterate over the grid values to calculate the effect
+  for (i in seq_len(nrow(ice_effect))) {
+    ice_effect[i, ] <- 
+      data %>% 
+      dplyr::mutate(!! names(grid) := grid[i, ]) %>% 
+      predict_model(object, newdata = .)
+  }
+  return(cbind(grid, ice_effect))
+}
+```
+
+We will now use this function to generate the ICE effect for the bonus-malus level in frequency models:
+
+```{r ice_data, warning = FALSE}
+# Use a random sample of the training observations
+set.seed(54321)
+mtpl_trn_sample <- mtpl_trn[sample(seq_len(nrow(mtpl_trn)), size = 1000), ]
+# Define the grid for the ages
+grid_bm <- data.frame('bm' = 0:22)
+# Calculate the ICE effect
+ice_tree <- tree_freq %>% ice(data = mtpl_trn_sample,
+                              grid = grid_bm)
+ice_gbm <- gbm_freq %>% ice(data = mtpl_trn_sample,
+                            grid = grid_bm)
+```
+
+After some reshaping we plot these ICE curves with the PD effect on top, as in Figure 8 of the paper:
+
+```{r ice_plot, fig.width = 8, fig.height=4}
+gridExtra::grid.arrange(
+  ice_tree %>% reshape2::melt(id.vars = 'bm',
+                              value.name = 'ice',
+                              variable.name = 'observation') %>%
+  dplyr::group_by(bm) %>% 
+  dplyr::mutate(pd = mean(ice)) %>% 
+  ggplot(aes(x = bm)) + 
+  geom_line(aes(y = ice, group = observation), color = 'grey', alpha = 0.1) + 
+  geom_line(aes(y = pd), size = 1, color = 'navy'),
+  
+  ice_gbm %>% reshape2::melt(id.vars = 'bm',
+                             value.name = 'ice',
+                             variable.name = 'observation') %>%
+  dplyr::group_by(bm) %>% 
+  dplyr::mutate(pd = mean(ice)) %>% 
+  ggplot(aes(x = bm)) + 
+  geom_line(aes(y = ice, group = observation), color = 'grey', alpha = 0.1) + 
+  geom_line(aes(y = pd), size = 1, color = 'navy'),
+  
+  ncol = 2
+)
+```
+
+## Interaction effects
+Tree-based models are often praised for their ability to detect interaction effects between variables. Friedman’s *H*-statistic estimates the interaction strength by measuring how much of the prediction variance originates from the interaction, see Section 4.4 in the paper for the details. The function `interact.gbm` calculates the *H*-statistic for a `gbm` object. (*Note: the function `interact.gbm` is not exported in Harry Southworth's version, so I include the function in the Rmd source of this Notebook.*)
+
+```{r interact_fun, include=FALSE}
+interact.gbm <- function(x, data, i.var = 1, n.trees = x$n.trees){
+   ###############################################################
+   # Do sanity checks on the call
+    if (x$interaction.depth < length(i.var)){
+       stop("interaction.depth too low in model call")
+   }
+
+   if (all(is.character(i.var))){
+      i <- match(i.var, x$var.names)
+      if (any(is.na(i))) {
+         stop("Variables given are not used in gbm model fit: ", i.var[is.na(i)])
+      }
+      else {
+         i.var <- i
+      }
+   }
+   if ((min(i.var) < 1) || (max(i.var) > length(x$var.names))) {
+      warning("i.var must be between 1 and ", length(x$var.names))
+   }
+   if (n.trees > x$n.trees) {
+      warning(paste("n.trees exceeds the number of trees in the model, ",
+                    x$n.trees,". Using ", x$n.trees, " trees.", sep = ""))
+      n.trees <- x$n.trees
+   }
+   # End of sanity checks
+   ###############################################################
+
+   unique.tab <- function(z,i.var) {
+      a <- unique(z[,i.var,drop=FALSE])
+      a$n <- table(factor(apply(z[,i.var,drop=FALSE],1,paste,collapse="\r"),
+                          levels=apply(a,1,paste,collapse="\r")))
+      return(a)
+   }
+
+   # convert factors
+   for(j in i.var) {
+      if(is.factor(data[,x$var.names[j]]))
+      data[,x$var.names[j]] <-
+      as.numeric(data[,x$var.names[j]])-1
+   }
+
+   # generate a list with all combinations of variables
+   a <- apply(expand.grid(rep(list(c(FALSE,TRUE)), length(i.var)))[-1,],1,
+              function(x) as.numeric(which(x)))
+   FF <- vector("list",length(a))
+   for(j in 1:length(a)) {
+      FF[[j]]$Z <- data.frame(unique.tab(data, x$var.names[i.var[a[[j]]]]))
+      FF[[j]]$n <- as.numeric(FF[[j]]$Z$n)
+      FF[[j]]$Z$n <- NULL
+      FF[[j]]$f <- .Call("gbm_plot",
+                         X = as.double(data.matrix(FF[[j]]$Z)),
+                         cRows = as.integer(nrow(FF[[j]]$Z)),
+                         cCols = as.integer(ncol(FF[[j]]$Z)),
+                         n.class = as.integer(x$num.classes),
+                         i.var = as.integer(i.var[a[[j]]] - 1),
+                         n.trees = as.integer(n.trees),
+                         initF = as.double(x$initF),
+                         trees = x$trees,
+                         c.splits = x$c.splits,
+                         var.type = as.integer(x$var.type),
+                         PACKAGE = "gbm")
+      # FF[[jj]]$Z is the data, f is the predictions, n is the number of levels for factors
+
+      # Need to restructure f to deal with multinomial case
+      FF[[j]]$f <- matrix(FF[[j]]$f, ncol=x$num.classes, byrow=FALSE)
+
+      # center the values
+      FF[[j]]$f <- apply(FF[[j]]$f, 2, function(x, w){
+                                          x - weighted.mean(x, w, na.rm=TRUE)
+                                       }, w=FF[[j]]$n)
+
+      # precompute the sign of these terms to appear in H
+      FF[[j]]$sign <- ifelse(length(a[[j]]) %% 2 == length(i.var) %% 2, 1, -1)
+   }
+
+   H <- FF[[length(a)]]$f
+
+   for(j in 1:(length(a)-1)){
+      i1 <- apply(FF[[length(a)]]$Z[,a[[j]], drop=FALSE], 1, paste, collapse="\r")
+      i2 <- apply(FF[[j]]$Z,1,paste,collapse="\r")
+      i <- match(i1, i2)
+
+      H <- H + with(FF[[j]], sign*f[i,])
+   }
+
+   # Compute H
+   w <- matrix(FF[[length(a)]]$n, ncol=1)
+   f <- matrix(FF[[length(a)]]$f^2, ncol=x$num.classes, byrow=FALSE)
+
+   top <- apply(H^2, 2, weighted.mean, w = w, na.rm = TRUE)
+   btm <- apply(f, 2, weighted.mean, w = w, na.rm = TRUE)
+   H <- top / btm
+
+   if (x$distribution$name=="multinomial"){
+      names(H) <- x$classes
+   }
+
+   # If H > 1, rounding and tiny main effects have messed things up
+   H[H > 1] <- NaN
+
+   return(sqrt(H))
+}
+```
+
+We now calculate two-way interaction strengths between variables and verify some values in Table 4 of the paper:
+
+```{r interact_gbm}
+gbm_freq %>% interact.gbm(data = mtpl_trn,
+                          i.var = c('fuel', 'power')) %>% round(4)
+gbm_freq %>% interact.gbm(data = mtpl_trn,
+                          i.var = c('ageph', 'sex')) %>% round(4)
+gbm_freq %>% interact.gbm(data = mtpl_trn,
+                          i.var = c('agec', 'coverage')) %>% round(4)
+gbm_freq %>% interact.gbm(data = mtpl_trn,
+                          i.var = c('ageph', 'power')) %>% round(4)
+```
+
+We use the partial dependence effects of a variable, grouped by another variable, to get an insight on the interaction behavior between those two variables. The function `par_dep_by` allows to generate such grouped PD effects:
+
+```{r pdp_by_fun}
+par_dep_by <- function(object, data, grid, by_var, ngroups = NULL) {
+  # Initialize a matrix to save the effect
+  ice_effect <- matrix(0, nrow = nrow(data), ncol = nrow(grid))
+  # Iterate over the grid values to calculate the effect
+  for (i in seq_len(ncol(ice_effect))) {
+    ice_effect[, i] <- 
+      data %>% 
+      dplyr::mutate(!! names(grid) := grid[i, ]) %>% 
+      predict_model(object, newdata = .)
+  }
+  # Add the grouping variable to the effect
+  pd_gr <- data %>% dplyr::select(!! by_var) %>% 
+    cbind(ice_effect)
+  # Bin the grouping variable in groups
+  if (!is.null(ngroups)) {
+    bins <- data %>% dplyr::pull(!! by_var) %>% 
+      cut(breaks = unique(quantile(., probs = seq(0, 1, 1/ngroups))),
+          include.lowest = TRUE, dig.lab = 4)
+    pd_gr <- pd_gr %>% dplyr::mutate(!! by_var := bins)
+  }
+  # Calculate the PD effect for each group
+  pd_gr <- pd_gr %>% dplyr::group_by_at(by_var) %>% 
+    dplyr::summarise_all(mean) %>% 
+    dplyr::rename(setNames(as.character(seq_len(nrow(grid))), unlist(grid)))
+  # Center the PD effects to start from zero
+  pd_gr[2:ncol(pd_gr)] <- pd_gr[2:ncol(pd_gr)] - pd_gr[[2]]
+  
+  return(pd_gr)
+}
+```
+
+We calculate the PD effect for `power`, grouped by `ageph` and `fuel`. Note that we use `ngroups = 5` for the continuous variable `ageph` but `ngroups = NULL` for the factor variable `fuel` (one group for each factor level).
+
+```{r pdp_by_data, warning=FALSE}
+pd_power_ageph <- gbm_freq %>% par_dep_by(data = mtpl_trn_sample,
+                                          grid = data.frame('power' = 30:150),
+                                          by_var = 'ageph',
+                                          ngroups = 5)
+
+pd_power_fuel <- gbm_freq %>% par_dep_by(data = mtpl_trn_sample,
+                                         grid = data.frame('power' = 30:150),
+                                         by_var = 'fuel',
+                                         ngroups = NULL)
+```
+
+We visualize the interaction behavior between `power` and both `ageph` and `fuel`. More graphs are available in Figure 9 in the paper. (*Note: the bin labels for `ageph` differ because a smaller sample size is used in this Notebook.*)
+
+```{r pdp_by_plot, fig.width=8, fig.height=4}
+gridExtra::grid.arrange(
+  pd_power_ageph %>% reshape2::melt(id.var = 'ageph',
+                                  value.name = 'pd_group',
+                                  variable.name = 'power') %>% 
+  dplyr::mutate(power = as.numeric(as.character(power))) %>% 
+  ggplot(aes(x = power, y = pd_group)) +
+  geom_line(aes(group = ageph, colour = ageph)),
+  
+  pd_power_fuel %>% reshape2::melt(id.var = 'fuel',
+                                   value.name = 'pd_group',
+                                   variable.name = 'power') %>% 
+  dplyr::mutate(power = as.numeric(as.character(power))) %>% 
+  ggplot(aes(x = power, y = pd_group)) +
+  geom_line(aes(group = fuel, colour = fuel)),
+  
+  ncol = 2
+)
+
+```
+
+## Statistical performance
+
+After gaining some insights from the different ML models, we now put focus on comparing the out-of-sample performance on the test data `mtpl_tst`. We predict each ML model on the test data:
+
+```{r pred_data, warning=FALSE}
+oos_pred <- tibble::tibble(
+  tree_freq = tree_freq %>% predict_model(newdata = mtpl_tst),
+  rf_freq = rf_freq %>% predict_model(newdata = mtpl_tst),
+  gbm_freq = gbm_freq %>% predict_model(newdata = mtpl_tst),
+  tree_sev = tree_sev %>% predict_model(newdata = mtpl_tst),
+  rf_sev = rf_sev %>% predict_model(newdata = mtpl_tst),
+  gbm_sev = gbm_sev %>% predict_model(newdata = mtpl_tst)
+)
+```
+
+These predictions are compared to the observed values in `mtpl_tst` with the Poisson/gamma deviance for frequency/severity models respectively:
+
+```{r dev_fun}
+# Poisson deviance
+dev_poiss <- function(ytrue, yhat) {
+  -2 * mean(dpois(ytrue, yhat, log = TRUE) - dpois(ytrue, ytrue, log = TRUE), na.rm = TRUE)
+}
+# Gamma deviance
+dev_gamma <- function(ytrue, yhat, wcase) {
+   -2 * mean(wcase * (log(ytrue/yhat) - (ytrue - yhat)/yhat), na.rm = TRUE)
+}
+```
+
+The out-of-sample deviances are calculated below. These are the values for data fold 3 in Figure 10 of the paper.
+
+```{r oos_comp}
+# Calculate the Poisson deviance for the frequency models
+oos_pred %>% dplyr::select(ends_with('_freq')) %>% 
+  purrr::map(~ dev_poiss(mtpl_tst$nclaims, .x * mtpl_tst$expo))
+# Calculate the gamma deviance for the severity models
+oos_pred %>% dplyr::select(ends_with('_sev')) %>% 
+  purrr::map(~ dev_gamma(mtpl_tst$average, .x, mtpl_tst$nclaims))
+```
+
+## Economic lift
+
+After comparing the ML models for frequency and severity, we now turn to a comparison at the premium level. We calculate the predicted premiums for the test data `mtpl_tst` by multiplying the frequency and severity:
+
+```{r prem_data}
+oos_pred <- oos_pred %>% dplyr::mutate(
+  tree_prem = tree_freq * tree_sev,
+  rf_prem = rf_freq * rf_sev,
+  gbm_prem = gbm_freq * gbm_sev
+)
+```
+
+The predicted premium totals for each model (adjusted for exposure) are calculated below. These correspond to the values in Table 5 of the paper for data fold 3. (*Note: the values for the random forest are slighlty different due to an implementation update to the `distRforest` package regarding subsampling.*)
+
+```{r prem_total}
+oos_pred %>% dplyr::select(ends_with('_prem')) %>% 
+  dplyr::summarise_all(~ sum(.x * mtpl_tst$expo))
+```
+
+We now focus on some model lift measures, which are introduced and analyzed in Sections 5.1 and 5.2 of the paper. To streamline the coding we add the observed target values from the test data `mtpl_tst` to the predictions data:
+
+```{r lift_data}
+oos_pred <- oos_pred %>% dplyr::mutate(
+  nclaims = mtpl_tst$nclaims,
+  expo = mtpl_tst$expo,
+  amount = mtpl_tst$amount
+)
+```
+
+
+### Loss ratio lift
+The loss ratio lift is assessed by applying the following steps:
+
++ sort policies from smallest to largest relativity
++ bin the policies in groups of equal exposure
++ calculate the loss ratio in each bin using the benchmark premium
+
+```{r lrl_fun}
+loss_ratio_lift <- function(data, bench, comp, ngroups) {
+  
+  # Calculate relativity and sort from small to large
+  data %>% dplyr::mutate(r = get(paste0(comp, '_prem')) / get(paste0(bench, '_prem'))) %>% 
+    dplyr::arrange(r) %>% 
+    # Bin in groups of equal exposure
+    dplyr::mutate(bin = cut(cumsum(expo),
+                            breaks = sum(expo) * (0:ngroups) / ngroups,
+                            labels = FALSE)) %>% 
+    dplyr::group_by(bin) %>% 
+    dplyr::mutate(r_lab = paste0('[', round(min(r), 2), ',', round(max(r), 2), ']')) %>% 
+    # Calculate loss ratio per bin
+    dplyr::summarise(r_lab = r_lab[1],
+                     loss_ratio = sum(amount) / sum(get(paste0(bench, '_prem'))),
+                     sum_expo = sum(expo))
+  
+}
+```
+
+We calculate the loss ratio lifts for the tree as benchmark and GBM as competitor and vice versa:
+
+```{r lrl_data}
+lrl_gbm_tree <- oos_pred %>% loss_ratio_lift(bench = 'tree',
+                                             comp = 'gbm',
+                                             ngroups = 5)
+lrl_gbm_tree
+lrl_tree_gbm <- oos_pred %>% loss_ratio_lift(bench = 'gbm',
+                                             comp = 'tree',
+                                             ngroups = 5)
+lrl_tree_gbm
+```
+
+Plotting these results next to each other clearly shows that the GBM aligns the risk better compared to the tree:
+
+```{r lrl_plot, fig.width=8, fig.height=4}
+gridExtra::grid.arrange(
+  lrl_gbm_tree %>% ggplot(aes(x = r_lab, y = loss_ratio)) +
+  geom_bar(stat = 'identity') +
+    ggtitle('comp: gbm / bench: tree'),
+  
+  lrl_tree_gbm %>% ggplot(aes(x = r_lab, y = loss_ratio)) +
+  geom_bar(stat = 'identity') +
+    ggtitle('comp: tree / bench: gbm'),
+  
+  ncol = 2
+)
+```
+
+
+### Double lift
+The double lift is assessed by applying the following steps:
+
++ sort policies from smallest to largest relativity
++ bin the policies in groups of equal exposure
++ calculate the average loss amount and average premiums (comp & bench) in each bin
++ calculate the percentage error of premium (comp & bench) to loss in each bin
+
+```{r dbl_fun}
+double_lift <- function(data, bench, comp, ngroups) {
+  
+  # Calculate relativity and sort from small to large
+  data %>% dplyr::mutate(r = get(paste0(comp, '_prem')) / get(paste0(bench, '_prem'))) %>% 
+    dplyr::arrange(r) %>% 
+     # Bin in groups of equal exposure
+    dplyr::mutate(bin = cut(cumsum(expo),
+                            breaks = sum(expo) * (0:ngroups) / ngroups,
+                            labels = FALSE)) %>% 
+    dplyr::group_by(bin) %>% 
+    dplyr::mutate(r_lab = paste0('[', round(min(r), 2), ',', round(max(r), 2), ']')) %>% 
+    # Calculate percentage errors for both tariffs
+    dplyr::summarise(r_lab = r_lab[1],
+                     error_comp = mean(get(paste0(comp, '_prem'))) / mean(amount) - 1,
+                     error_bench = mean(get(paste0(bench, '_prem'))) / mean(amount) - 1,
+                     sum_expo = sum(expo))
+  
+}
+```
+
+We calculate the double lift for the tree as benchmark and GBM as competitor:
+
+```{r dbl_data}
+dbl_gbm_tree <- oos_pred %>% double_lift(bench = 'tree',
+                                         comp = 'gbm',
+                                         ngroups = 5)
+dbl_gbm_tree
+```
+
+Plotting these results clearly shows that the GBM aligns the risk better compared to the tree:
+
+```{r dbl_plot, fig.width=8, fig.height=4}
+dbl_gbm_tree %>% reshape2::melt(id.vars = c('r_lab', 'bin' , 'sum_expo'),
+                                value.name = 'perc_err',
+                                variable.name = 'tariff') %>% 
+  ggplot(aes(x = r_lab, y = perc_err)) +
+  geom_line(aes(group = tariff, colour = tariff))
+```
+
+
+### Gini index
+
+The last measure for economic lift that we analyze is the Gini index obtained from an ordered Lorenz curve. The function `gini()` from the `cplm` package allows to calculate Gini indices for competing models. The mini-max strategy selects the GBM as the model that is least vulnerable to alternative models:
+
+```{r gini_fun, message=FALSE}
+library(cplm)
+gini(loss = 'amount',
+     score = paste0(c('tree', 'rf', 'gbm'), '_prem'),
+     data = as.data.frame(oos_pred))
+```
+
+We can program the mini-max strategy explicitly as follows, which gives the ranking `gbm > rf > tree`:
+
+```{r gini_data}
+gini(loss = 'amount',
+     score = paste0(c('tree', 'rf', 'gbm'), '_prem'),
+     data = as.data.frame(oos_pred)) %>% 
+  slot('gini') %>% 
+  as.data.frame() %>% 
+  dplyr::mutate(max_gini = pmax(tree_prem, rf_prem, gbm_prem)) %>% 
+  dplyr::mutate(bench = c('tree', 'rf', 'gbm')) %>% 
+  dplyr::arrange(max_gini)
+```
+
+*Note: the values differ from those in Table 6 of the paper because the analysis in this Notebook uses only the out-of-sample observations from $\mathcal{D}_3$, while the results in the paper use the out-of-sample data from all six folds $\mathcal{D}_1$ up to $\mathcal{D}_6$. The conclusions remain the same however.*
+
+
+## Conclusions
+This Notebook replicates most of the results from our paper on "Boosting insights in insurance tariff plans with tree-based machine learning methods". Hopefully this helps you to jumpstart your tree-based ML analysis for insurance pricing or related applications. Happy coding!
